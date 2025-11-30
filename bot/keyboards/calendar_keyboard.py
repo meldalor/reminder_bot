@@ -2,6 +2,7 @@
 
 import datetime
 import calendar
+from typing import List
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
@@ -16,12 +17,13 @@ def separate_callback_data(data: str) -> tuple:
     return parts[0], int(parts[1]), int(parts[2]), int(parts[3])
 
 
-def create_calendar(year: int = None, month: int = None) -> InlineKeyboardMarkup:
+def create_calendar(year: int = None, month: int = None, selected_dates: List[datetime.date] = None) -> InlineKeyboardMarkup:
     """
     Create an inline keyboard with the provided year and month.
 
     :param year: Year to use in the calendar, if None the current year is used.
     :param month: Month to use in the calendar, if None the current month is used.
+    :param selected_dates: List of already selected dates to mark with checkmarks.
     :return: Returns the InlineKeyboardMarkup object with the calendar.
     """
     now = datetime.datetime.now()
@@ -29,6 +31,8 @@ def create_calendar(year: int = None, month: int = None) -> InlineKeyboardMarkup
         year = now.year
     if month is None:
         month = now.month
+    if selected_dates is None:
+        selected_dates = []
 
     data_ignore = create_callback_data("IGNORE", year, month, 0)
     keyboard = []
@@ -56,20 +60,25 @@ def create_calendar(year: int = None, month: int = None) -> InlineKeyboardMarkup
             if day == 0:
                 row.append(InlineKeyboardButton(text=" ", callback_data=data_ignore))
             else:
+                # Check if this date is selected
+                current_date = datetime.date(year, month, day)
+                is_selected = current_date in selected_dates
+                day_text = f"✓ {day}" if is_selected else str(day)
+
                 row.append(InlineKeyboardButton(
-                    text=str(day),
+                    text=day_text,
                     callback_data=create_callback_data("DAY", year, month, day)
                 ))
         keyboard.append(row)
 
-    # Last row - Navigation buttons and Cancel
+    # Last row - Navigation buttons and action buttons
     row = []
     row.append(InlineKeyboardButton(
         text="<",
         callback_data=create_callback_data("PREV-MONTH", year, month, 1)
     ))
     row.append(InlineKeyboardButton(
-        text="Отмена",
+        text="❌ Отмена",
         callback_data="cancel"
     ))
     row.append(InlineKeyboardButton(
@@ -78,39 +87,13 @@ def create_calendar(year: int = None, month: int = None) -> InlineKeyboardMarkup
     ))
     keyboard.append(row)
 
+    # Add confirm button if any dates are selected
+    if selected_dates:
+        confirm_row = []
+        confirm_row.append(InlineKeyboardButton(
+            text=f"✅ Подтвердить ({len(selected_dates)})",
+            callback_data="confirm_dates"
+        ))
+        keyboard.append(confirm_row)
+
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-
-async def process_calendar_selection(callback_query, callback_data: str) -> tuple:
-    """
-    Process the callback_query for calendar navigation.
-
-    :param callback_query: The callback query from aiogram
-    :param callback_data: The callback data string
-    :return: Returns a tuple (Boolean, datetime.date), indicating if a date is selected
-    """
-    ret_data = (False, None)
-    action, year, month, day = separate_callback_data(callback_data)
-    curr = datetime.date(year, month, 1)
-
-    if action == "IGNORE":
-        await callback_query.answer()
-    elif action == "DAY":
-        await callback_query.answer()
-        ret_data = True, datetime.date(year, month, day)
-    elif action == "PREV-MONTH":
-        pre = curr - datetime.timedelta(days=1)
-        await callback_query.message.edit_reply_markup(
-            reply_markup=create_calendar(pre.year, pre.month)
-        )
-        await callback_query.answer()
-    elif action == "NEXT-MONTH":
-        ne = curr + datetime.timedelta(days=31)
-        await callback_query.message.edit_reply_markup(
-            reply_markup=create_calendar(ne.year, ne.month)
-        )
-        await callback_query.answer()
-    else:
-        await callback_query.answer("Что-то пошло не так!")
-
-    return ret_data
