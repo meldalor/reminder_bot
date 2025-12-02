@@ -17,7 +17,7 @@ from bot.config import (
     CITY_TIMEZONES
 )
 from bot.database import get_user_timezone
-from bot.keyboards import keyboard, inline_markup_cancel, create_inline_keyboard
+from bot.keyboards import keyboard, inline_markup_cancel, create_inline_keyboard, create_calendar, separate_callback_data
 from bot.states import ReminderStates
 from bot.utils import resolve_date, finalize_date
 
@@ -90,29 +90,18 @@ async def get_frequency(message: types.Message, state: FSMContext):
     data = await state.get_data()
     bot_message_id = data['bot_message_id']
     name_reminder = data['name_reminder']
-    await state.update_data(frequency=frequency)
+    await state.update_data(frequency=frequency, selected_calendar_dates=[])
 
-    user_id = message.from_user.id
-    timezone = await get_user_timezone(user_id)
-    current_date = datetime.datetime.now(pytz.timezone(timezone)).strftime(DATE_FORMAT)
-
-    inline_button_today = InlineKeyboardButton(
-        text=f"Сегодня - {current_date}",
-        callback_data="current_date"
-    )
-    inline_button_cancel = InlineKeyboardButton(text="Отмена", callback_data="cancel")
-    inline_markup_date = InlineKeyboardMarkup(
-        inline_keyboard=[[inline_button_today], [inline_button_cancel]]
-    )
+    calendar_markup = create_calendar()
 
     await message.bot.edit_message_text(
         text=f"Название уведомления: *{name_reminder}*\n"
              f"Частота: *{frequency}*\n\n"
-             f"Введите даты в формате {DATE_FORMAT} или {FULL_DATE_FORMAT} "
+             f"Выберите даты из календаря или введите даты в формате {DATE_FORMAT} или {FULL_DATE_FORMAT} "
              f"(можно несколько через запятую, например 15.10,16.10):",
         chat_id=message.chat.id,
         message_id=bot_message_id,
-        reply_markup=inline_markup_date,
+        reply_markup=calendar_markup,
         parse_mode="Markdown"
     )
     await state.set_state(ReminderStates.waiting_for_date)
@@ -153,27 +142,19 @@ async def get_date(message: types.Message, state: FSMContext):
         bot_message_id = data['bot_message_id']
         name_reminder = data['name_reminder']
         frequency = data['frequency']
-        user_id = message.from_user.id
-        timezone = await get_user_timezone(user_id)
-        current_date = datetime.datetime.now(pytz.timezone(timezone)).strftime(DATE_FORMAT)
 
-        inline_button_today = InlineKeyboardButton(
-            text=f"Сегодня - {current_date}",
-            callback_data="current_date"
-        )
-        inline_button_cancel = InlineKeyboardButton(text="Отмена", callback_data="cancel")
-        inline_markup_date = InlineKeyboardMarkup(
-            inline_keyboard=[[inline_button_today], [inline_button_cancel]]
-        )
+        # Reset selected calendar dates on error
+        await state.update_data(selected_calendar_dates=[])
+        calendar_markup = create_calendar()
 
         await message.bot.edit_message_text(
             text=f"Название уведомления: *{name_reminder}*\n"
                  f"Частота: *{frequency}*\n\n"
-                 f"Пожалуйста, введите даты в формате {DATE_FORMAT} или {FULL_DATE_FORMAT} "
+                 f"Пожалуйста, выберите даты из календаря или введите даты в формате {DATE_FORMAT} или {FULL_DATE_FORMAT} "
                  f"(можно несколько через запятую, например 15.10,16.10):",
             chat_id=message.chat.id,
             message_id=bot_message_id,
-            reply_markup=inline_markup_date,
+            reply_markup=calendar_markup,
             parse_mode="Markdown"
         )
 
@@ -320,15 +301,84 @@ async def cancel_creation(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data == "current_date")
-async def set_current_date(callback: types.CallbackQuery, state: FSMContext):
-    """Set current date for reminder."""
-    user_id = callback.from_user.id
-    timezone = await get_user_timezone(user_id)
-    current_date = datetime.datetime.now(pytz.timezone(timezone)).strftime(FULL_DATE_FORMAT)
+@router.callback_query(lambda c: c.data.startswith(("DAY;", "PREV-MONTH;", "NEXT-MONTH;", "IGNORE;")))
+async def handle_calendar_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Handle calendar callback queries."""
+    current_state = await state.get_state()
 
-    await state.update_data(dates=current_date)
+    # Only process calendar callbacks when waiting for date
+    if current_state != ReminderStates.waiting_for_date:
+        await callback.answer()
+        return
+
+    action, year, month, day = separate_callback_data(callback.data)
     data = await state.get_data()
+    selected_dates = data.get('selected_calendar_dates', [])
+
+    # Convert string dates back to date objects if needed
+    if selected_dates and isinstance(selected_dates[0], str):
+        selected_dates = [datetime.datetime.strptime(d, FULL_DATE_FORMAT).date() for d in selected_dates]
+
+    curr = datetime.date(year, month, 1)
+
+    if action == "IGNORE":
+        await callback.answer()
+    elif action == "DAY":
+        # Toggle date selection
+        selected_date = datetime.date(year, month, day)
+        if selected_date in selected_dates:
+            selected_dates.remove(selected_date)
+            await callback.answer("Дата убрана")
+        else:
+            selected_dates.append(selected_date)
+            await callback.answer("Дата добавлена")
+
+        # Update state with selected dates
+        await state.update_data(selected_calendar_dates=selected_dates)
+
+        # Update calendar with checkmarks
+        calendar_markup = create_calendar(year, month, selected_dates)
+        await callback.message.edit_reply_markup(reply_markup=calendar_markup)
+
+    elif action == "PREV-MONTH":
+        pre = curr - datetime.timedelta(days=1)
+        calendar_markup = create_calendar(pre.year, pre.month, selected_dates)
+        await callback.message.edit_reply_markup(reply_markup=calendar_markup)
+        await callback.answer()
+
+    elif action == "NEXT-MONTH":
+        ne = curr + datetime.timedelta(days=31)
+        calendar_markup = create_calendar(ne.year, ne.month, selected_dates)
+        await callback.message.edit_reply_markup(reply_markup=calendar_markup)
+        await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "confirm_dates")
+async def confirm_calendar_dates(callback: types.CallbackQuery, state: FSMContext):
+    """Confirm selected dates from calendar."""
+    current_state = await state.get_state()
+
+    if current_state != ReminderStates.waiting_for_date:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    selected_dates = data.get('selected_calendar_dates', [])
+
+    if not selected_dates:
+        await callback.answer("Выберите хотя бы одну дату!")
+        return
+
+    # Convert date objects to strings in FULL_DATE_FORMAT
+    if isinstance(selected_dates[0], datetime.date):
+        selected_dates_str = [d.strftime(FULL_DATE_FORMAT) for d in selected_dates]
+    else:
+        selected_dates_str = selected_dates
+
+    # Sort dates
+    selected_dates_sorted = sorted(selected_dates_str, key=lambda x: datetime.datetime.strptime(x, FULL_DATE_FORMAT))
+
+    await state.update_data(dates=",".join(selected_dates_sorted))
     bot_message_id = data['bot_message_id']
     name_reminder = data['name_reminder']
     frequency = data['frequency']
@@ -336,7 +386,7 @@ async def set_current_date(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.bot.edit_message_text(
         text=f"Название уведомления: *{name_reminder}*\n"
              f"Частота: *{frequency}*\n"
-             f"Даты: *{current_date}*\n\n"
+             f"Даты: *{','.join(selected_dates_sorted)}*\n\n"
              f"Введите время в формате {TIME_FORMAT} (можно несколько через запятую):",
         chat_id=callback.message.chat.id,
         message_id=bot_message_id,
