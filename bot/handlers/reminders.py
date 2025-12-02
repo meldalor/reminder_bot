@@ -17,7 +17,15 @@ from bot.config import (
     CITY_TIMEZONES
 )
 from bot.database import get_user_timezone
-from bot.keyboards import keyboard, inline_markup_cancel, create_inline_keyboard, create_calendar, separate_callback_data
+from bot.keyboards import (
+    keyboard,
+    inline_markup_cancel,
+    create_inline_keyboard,
+    create_calendar,
+    separate_callback_data,
+    inline_markup_quick_templates,
+    inline_markup_popular_times
+)
 from bot.states import ReminderStates
 from bot.utils import resolve_date, finalize_date
 
@@ -26,7 +34,7 @@ router = Router()
 
 @router.message(F.text == '+')
 async def add_reminder(message: types.Message, state: FSMContext):
-    """Start reminder creation process."""
+    """Start reminder creation process with quick templates."""
     user_id = message.from_user.id
     timezone = await get_user_timezone(user_id)
 
@@ -40,9 +48,116 @@ async def add_reminder(message: types.Message, state: FSMContext):
         await state.update_data(bot_message_id=msg.message_id)
         await state.set_state(ReminderStates.waiting_for_city)
     else:
-        msg = await message.answer("Введите название уведомления:", reply_markup=inline_markup_cancel)
+        msg = await message.answer(
+            "Выберите быстрый шаблон или создайте свое напоминание:",
+            reply_markup=inline_markup_quick_templates
+        )
         await state.update_data(bot_message_id=msg.message_id)
-        await state.set_state(ReminderStates.waiting_for_name)
+        await state.set_state(ReminderStates.waiting_for_template_choice)
+
+
+@router.callback_query(lambda c: c.data.startswith("quick_"))
+async def handle_quick_template(callback: types.CallbackQuery, state: FSMContext):
+    """Handle quick template selection."""
+    template = callback.data
+    user_id = callback.from_user.id
+    timezone = await get_user_timezone(user_id)
+    user_tz = pytz.timezone(timezone)
+    current_dt = datetime.datetime.now(user_tz)
+
+    # Calculate date and time based on template
+    if template == "quick_in_1h":
+        reminder_dt = current_dt + datetime.timedelta(hours=1)
+        template_name = "Напоминание через 1 час"
+    elif template == "quick_in_2h":
+        reminder_dt = current_dt + datetime.timedelta(hours=2)
+        template_name = "Напоминание через 2 часа"
+    elif template == "quick_tomorrow_9":
+        reminder_dt = (current_dt + datetime.timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        template_name = "Напоминание завтра в 9:00"
+    elif template == "quick_tomorrow_18":
+        reminder_dt = (current_dt + datetime.timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+        template_name = "Напоминание завтра в 18:00"
+    elif template == "quick_in_1week":
+        reminder_dt = current_dt + datetime.timedelta(weeks=1)
+        template_name = "Напоминание через неделю"
+    else:
+        await callback.answer("Неизвестный шаблон")
+        return
+
+    date_str = reminder_dt.strftime(FULL_DATE_FORMAT)
+    time_str = reminder_dt.strftime(TIME_FORMAT)
+
+    data = await state.get_data()
+    bot_message_id = data['bot_message_id']
+
+    await state.update_data(
+        quick_template=template,
+        dates=date_str,
+        times=time_str,
+        frequency=FREQUENCY_ZERO
+    )
+
+    await callback.message.edit_text(
+        f"Шаблон: *{template_name}*\n"
+        f"Дата: *{date_str}*\n"
+        f"Время: *{time_str}*\n\n"
+        f"Введите название напоминания:",
+        reply_markup=inline_markup_cancel,
+        parse_mode="Markdown"
+    )
+    await state.set_state(ReminderStates.waiting_for_quick_template_name)
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "custom_reminder")
+async def handle_custom_reminder(callback: types.CallbackQuery, state: FSMContext):
+    """Handle custom reminder creation."""
+    await callback.message.edit_text(
+        "Введите название уведомления:",
+        reply_markup=inline_markup_cancel
+    )
+    await state.set_state(ReminderStates.waiting_for_name)
+    await callback.answer()
+
+
+@router.message(ReminderStates.waiting_for_quick_template_name)
+async def get_quick_template_name(message: types.Message, state: FSMContext):
+    """Handle reminder name input for quick template."""
+    await message.delete()
+    data = await state.get_data()
+    bot_message_id = data['bot_message_id']
+    name_reminder = message.text
+    dates = data['dates']
+    times = data['times']
+    frequency = data['frequency']
+
+    user_id = message.from_user.id
+    timezone = await get_user_timezone(user_id)
+    current_dt = datetime.datetime.now(pytz.UTC)
+
+    # Convert to UTC for storage
+    finalized_date = finalize_date(dates, times, current_dt, timezone)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT INTO reminders (user_id, name_reminder, frequency, dates, times, active) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (user_id, name_reminder, frequency, finalized_date, times, 1)
+        )
+        await db.commit()
+
+    await message.bot.edit_message_text(
+        text=f"Напоминание успешно добавлено!\n\n"
+             f"Название: *{name_reminder}*\n"
+             f"Дата: *{dates}*\n"
+             f"Время: *{times}*\n\n"
+             f"Напоминание сработает: *{dates} в {times}*",
+        chat_id=message.chat.id,
+        message_id=bot_message_id,
+        parse_mode="Markdown"
+    )
+    await state.clear()
 
 
 @router.message(ReminderStates.waiting_for_name)
@@ -130,10 +245,10 @@ async def get_date(message: types.Message, state: FSMContext):
             text=f"Название уведомления: *{name_reminder}*\n"
                  f"Частота: *{frequency}*\n"
                  f"Даты: *{','.join(resolved_dates)}*\n\n"
-                 f"Введите время в формате {TIME_FORMAT} (можно несколько через запятую):",
+                 f"Выберите популярное время или введите свое в формате {TIME_FORMAT}:",
             chat_id=message.chat.id,
             message_id=bot_message_id,
-            reply_markup=inline_markup_cancel,
+            reply_markup=inline_markup_popular_times,
             parse_mode="Markdown"
         )
         await state.set_state(ReminderStates.waiting_for_time)
@@ -157,6 +272,77 @@ async def get_date(message: types.Message, state: FSMContext):
             reply_markup=calendar_markup,
             parse_mode="Markdown"
         )
+
+
+@router.callback_query(lambda c: c.data.startswith("time_"))
+async def handle_time_selection(callback: types.CallbackQuery, state: FSMContext):
+    """Handle popular time button selection."""
+    current_state = await state.get_state()
+
+    if current_state != ReminderStates.waiting_for_time:
+        await callback.answer()
+        return
+
+    time_data = callback.data
+
+    if time_data == "time_custom":
+        # User wants to enter custom time
+        data = await state.get_data()
+        bot_message_id = data['bot_message_id']
+        name_reminder = data['name_reminder']
+        frequency = data['frequency']
+        dates = data['dates']
+
+        await callback.message.edit_text(
+            text=f"Название уведомления: *{name_reminder}*\n"
+                 f"Частота: *{frequency}*\n"
+                 f"Даты: *{dates}*\n\n"
+                 f"Введите время в формате {TIME_FORMAT} (можно несколько через запятую):",
+            reply_markup=inline_markup_cancel,
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    # Extract time from callback data (e.g., "time_09:00" -> "09:00")
+    selected_time = time_data.replace("time_", "")
+
+    # Process the selected time
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    name_reminder = data['name_reminder']
+    frequency = data['frequency']
+    dates = data['dates']
+    timezone = await get_user_timezone(user_id)
+    current_dt = datetime.datetime.now(pytz.UTC)
+
+    date_list = dates.split(",")
+    finalized_dates = []
+    for date in date_list:
+        finalized_date = finalize_date(date, selected_time, current_dt, timezone)
+        if finalized_date not in finalized_dates:
+            finalized_dates.append(finalized_date)
+    finalized_dates.sort()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT INTO reminders (user_id, name_reminder, frequency, dates, times, active) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (user_id, name_reminder, frequency, ",".join(finalized_dates), selected_time, 1)
+        )
+        await db.commit()
+
+    bot_message_id = data['bot_message_id']
+    await callback.message.edit_text(
+        text=f"Напоминание успешно добавлено!\n\n"
+             f"Название: *{name_reminder}*\n"
+             f"Частота: *{frequency}*\n"
+             f"Даты: *{','.join(finalized_dates)}*\n"
+             f"Время: *{selected_time}*",
+        parse_mode="Markdown"
+    )
+    await state.clear()
+    await callback.answer("Напоминание создано!")
 
 
 @router.message(ReminderStates.waiting_for_time)
@@ -387,10 +573,10 @@ async def confirm_calendar_dates(callback: types.CallbackQuery, state: FSMContex
         text=f"Название уведомления: *{name_reminder}*\n"
              f"Частота: *{frequency}*\n"
              f"Даты: *{','.join(selected_dates_sorted)}*\n\n"
-             f"Введите время в формате {TIME_FORMAT} (можно несколько через запятую):",
+             f"Выберите популярное время или введите свое в формате {TIME_FORMAT}:",
         chat_id=callback.message.chat.id,
         message_id=bot_message_id,
-        reply_markup=inline_markup_cancel,
+        reply_markup=inline_markup_popular_times,
         parse_mode="Markdown"
     )
     await state.set_state(ReminderStates.waiting_for_time)
