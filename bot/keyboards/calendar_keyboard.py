@@ -87,13 +87,17 @@ def create_calendar(year: int = None, month: int = None, selected_dates: List[da
     ))
     keyboard.append(row)
 
-    # Add confirm button if any dates are selected
+    # Add clear and confirm buttons if any dates are selected
     if selected_dates:
-        confirm_row = []
-        confirm_row.append(InlineKeyboardButton(
+        action_row = []
+        action_row.append(InlineKeyboardButton(
+            text="🗑️ Очистить",
+            callback_data="clear_dates"
+        ))
+        action_row.append(InlineKeyboardButton(
             text=f"✅ Подтвердить ({len(selected_dates)})",
             callback_data="confirm_dates"
         ))
-        keyboard.append(confirm_row)
+        keyboard.append(action_row)
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)

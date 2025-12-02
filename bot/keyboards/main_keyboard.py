@@ -29,10 +29,11 @@ def create_inline_keyboard(buttons: list[list[tuple[str, str]]]) -> InlineKeyboa
 # Main menu keyboard
 button_add = KeyboardButton(text='+')
 button_list = KeyboardButton(text='Мои уведомления')
+button_history = KeyboardButton(text='📊 История')
 button_setcity = KeyboardButton(text='Изменить часовой пояс')
 
 keyboard = ReplyKeyboardMarkup(
-    keyboard=[[button_add, button_list], [button_setcity]],
+    keyboard=[[button_add, button_list], [button_history, button_setcity]],
     resize_keyboard=True
 )
 
@@ -55,3 +56,13 @@ popular_time_buttons = [
     [("✏️ Ввести свое время", "time_custom"), ("Отмена", "cancel")]
 ]
 inline_markup_popular_times = create_inline_keyboard(popular_time_buttons)
+
+# Frequency presets for custom reminders
+frequency_preset_buttons = [
+    [("🚫 Не повторять", "freq_0")],
+    [("📅 Каждый день", "freq_1d"), ("📅 Каждую неделю", "freq_7d")],
+    [("📅 Каждый месяц", "freq_30d"), ("📅 Каждый год", "freq_365d")],
+    [("⏰ Каждый час", "freq_1h"), ("⏰ Каждые 30 минут", "freq_30min")],
+    [("✏️ Свой вариант", "freq_custom"), ("Отмена", "cancel")]
+]
+inline_markup_frequency_presets = create_inline_keyboard(frequency_preset_buttons)

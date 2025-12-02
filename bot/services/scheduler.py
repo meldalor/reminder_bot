@@ -108,16 +108,27 @@ async def send_reminders(bot):
                 new_reminder_id = (await (await db.execute(
                     'SELECT last_insert_rowid()'
                 )).fetchone())[0]
-                inline_markup_new = create_inline_keyboard([[("done 📝", f"delete_{new_reminder_id}")]])
+
+                # Create inline keyboard with snooze and done buttons
+                inline_markup_new = create_inline_keyboard([
+                    [("⏰ +5мин", f"snooze_5_{new_reminder_id}"), ("⏰ +15мин", f"snooze_15_{new_reminder_id}")],
+                    [("⏰ +1час", f"snooze_60_{new_reminder_id}"), ("📅 Завтра", f"snooze_tomorrow_{new_reminder_id}")],
+                    [("✅ Готово", f"delete_{new_reminder_id}")]
+                ])
             else:
                 # For last temporary reminder use current reminder_id
-                inline_markup_new = create_inline_keyboard([[("done 📝", f"last_{reminder_id}")]])
+                inline_markup_new = create_inline_keyboard([
+                    [("⏰ +5мин", f"snooze_5_{reminder_id}"), ("⏰ +15мин", f"snooze_15_{reminder_id}")],
+                    [("⏰ +1час", f"snooze_60_{reminder_id}"), ("📅 Завтра", f"snooze_tomorrow_{reminder_id}")],
+                    [("✅ Готово", f"last_{reminder_id}")]
+                ])
 
             # Send reminder message
             message = await bot.send_message(
                 user_id,
-                f"Напоминание: {name_reminder}",
-                reply_markup=inline_markup_new
+                f"🔔 Напоминание: *{name_reminder}*",
+                reply_markup=inline_markup_new,
+                parse_mode="Markdown"
             )
 
             # Update last_message_id

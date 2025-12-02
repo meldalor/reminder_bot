@@ -24,7 +24,8 @@ from bot.keyboards import (
     create_calendar,
     separate_callback_data,
     inline_markup_quick_templates,
-    inline_markup_popular_times
+    inline_markup_popular_times,
+    inline_markup_frequency_presets
 )
 from bot.states import ReminderStates
 from bot.utils import resolve_date, finalize_date
@@ -147,12 +148,29 @@ async def get_quick_template_name(message: types.Message, state: FSMContext):
         )
         await db.commit()
 
+    # Calculate when reminder will trigger
+    reminder_dt = datetime.datetime.strptime(f"{dates} {times}", f"{FULL_DATE_FORMAT} {TIME_FORMAT}")
+    reminder_dt = pytz.timezone(timezone).localize(reminder_dt)
+    current_dt = datetime.datetime.now(pytz.timezone(timezone))
+    time_diff = reminder_dt - current_dt
+
+    # Format time difference
+    if time_diff.days > 0:
+        time_until = f"через {time_diff.days} дн. {time_diff.seconds // 3600} ч."
+    elif time_diff.seconds >= 3600:
+        hours = time_diff.seconds // 3600
+        minutes = (time_diff.seconds % 3600) // 60
+        time_until = f"через {hours} ч. {minutes} мин."
+    else:
+        minutes = time_diff.seconds // 60
+        time_until = f"через {minutes} мин."
+
     await message.bot.edit_message_text(
-        text=f"Напоминание успешно добавлено!\n\n"
-             f"Название: *{name_reminder}*\n"
-             f"Дата: *{dates}*\n"
-             f"Время: *{times}*\n\n"
-             f"Напоминание сработает: *{dates} в {times}*",
+        text=f"✅ Напоминание успешно добавлено!\n\n"
+             f"📝 Название: *{name_reminder}*\n"
+             f"📅 Дата: *{dates}*\n"
+             f"🕐 Время: *{times}*\n\n"
+             f"⏰ Напоминание сработает {time_until} (*{dates} в {times}*)",
         chat_id=message.chat.id,
         message_id=bot_message_id,
         parse_mode="Markdown"
@@ -171,14 +189,83 @@ async def get_name(message: types.Message, state: FSMContext):
     await state.update_data(name_reminder=name_reminder)
     await message.bot.edit_message_text(
         text=f"Название уведомления: *{name_reminder}*\n\n"
-             f"Введите частоту уведомления ({FREQUENCY_ZERO} для одноразового "
-             f"или, например, '1min 1h 1d 1m 1y'):",
+             f"Выберите частоту повторения или введите свою:",
         chat_id=message.chat.id,
         message_id=bot_message_id,
-        reply_markup=inline_markup_cancel,
+        reply_markup=inline_markup_frequency_presets,
         parse_mode="Markdown"
     )
     await state.set_state(ReminderStates.waiting_for_frequency)
+
+
+@router.callback_query(lambda c: c.data.startswith("freq_"))
+async def handle_frequency_preset(callback: types.CallbackQuery, state: FSMContext):
+    """Handle frequency preset button selection."""
+    current_state = await state.get_state()
+
+    if current_state != ReminderStates.waiting_for_frequency:
+        await callback.answer()
+        return
+
+    freq_data = callback.data
+    data = await state.get_data()
+    bot_message_id = data['bot_message_id']
+    name_reminder = data['name_reminder']
+
+    if freq_data == "freq_custom":
+        # User wants to enter custom frequency
+        await callback.message.edit_text(
+            text=f"Название уведомления: *{name_reminder}*\n\n"
+                 f"Введите частоту в формате '{FREQUENCY_ZERO}' для одноразового или '1min 1h 1d 1m 1y' "
+                 f"(можно указать только часть):",
+            reply_markup=inline_markup_cancel,
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    # Extract frequency from callback data (e.g., "freq_0" -> "0", "freq_1d" -> "1d")
+    frequency = freq_data.replace("freq_", "")
+
+    # Convert human-readable frequency to internal format
+    freq_map = {
+        "0": FREQUENCY_ZERO,
+        "1d": "1d",
+        "7d": "7d",
+        "30d": "30d",
+        "365d": "365d",
+        "1h": "1h",
+        "30min": "30min"
+    }
+
+    frequency = freq_map.get(frequency, frequency)
+
+    # Determine human-readable description
+    freq_display_map = {
+        FREQUENCY_ZERO: "Не повторяется",
+        "1d": "Каждый день",
+        "7d": "Каждую неделю",
+        "30d": "Каждый месяц",
+        "365d": "Каждый год",
+        "1h": "Каждый час",
+        "30min": "Каждые 30 минут"
+    }
+    freq_display = freq_display_map.get(frequency, frequency)
+
+    await state.update_data(frequency=frequency, selected_calendar_dates=[], calendar_mode=False)
+
+    calendar_markup = create_calendar()
+
+    await callback.message.edit_text(
+        text=f"Название уведомления: *{name_reminder}*\n"
+             f"Частота: *{freq_display}*\n\n"
+             f"Выберите даты из календаря или введите даты в формате {DATE_FORMAT} или {FULL_DATE_FORMAT} "
+             f"(можно несколько через запятую, например 15.10,16.10):",
+        reply_markup=calendar_markup,
+        parse_mode="Markdown"
+    )
+    await state.set_state(ReminderStates.waiting_for_date)
+    await callback.answer()
 
 
 @router.message(ReminderStates.waiting_for_frequency)
@@ -205,7 +292,7 @@ async def get_frequency(message: types.Message, state: FSMContext):
     data = await state.get_data()
     bot_message_id = data['bot_message_id']
     name_reminder = data['name_reminder']
-    await state.update_data(frequency=frequency, selected_calendar_dates=[])
+    await state.update_data(frequency=frequency, selected_calendar_dates=[], calendar_mode=False)
 
     calendar_markup = create_calendar()
 
@@ -226,6 +313,14 @@ async def get_frequency(message: types.Message, state: FSMContext):
 async def get_date(message: types.Message, state: FSMContext):
     """Handle reminder date input."""
     await message.delete()
+
+    data = await state.get_data()
+    calendar_mode = data.get('calendar_mode', False)
+
+    # If calendar mode is active, ignore text input
+    if calendar_mode:
+        return
+
     dates = message.text
 
     try:
@@ -235,7 +330,6 @@ async def get_date(message: types.Message, state: FSMContext):
             resolved_date, _ = resolve_date(date)
             resolved_dates.append(resolved_date)
 
-        data = await state.get_data()
         bot_message_id = data['bot_message_id']
         name_reminder = data['name_reminder']
         frequency = data['frequency']
@@ -253,7 +347,6 @@ async def get_date(message: types.Message, state: FSMContext):
         )
         await state.set_state(ReminderStates.waiting_for_time)
     except ValueError:
-        data = await state.get_data()
         bot_message_id = data['bot_message_id']
         name_reminder = data['name_reminder']
         frequency = data['frequency']
@@ -326,19 +419,39 @@ async def handle_time_selection(callback: types.CallbackQuery, state: FSMContext
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            'INSERT INTO reminders (user_id, name_reminder, frequency, dates, times, active) '
-            'VALUES (?, ?, ?, ?, ?, ?)',
-            (user_id, name_reminder, frequency, ",".join(finalized_dates), selected_time, 1)
+            'INSERT INTO reminders (user_id, name_reminder, frequency, dates, times, active, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (user_id, name_reminder, frequency, ",".join(finalized_dates), selected_time, 1, datetime.datetime.now(pytz.UTC).isoformat())
         )
         await db.commit()
 
+    # Calculate when reminder will trigger
+    user_tz = pytz.timezone(timezone)
+    first_date_str = finalized_dates[0]
+    reminder_dt = datetime.datetime.strptime(f"{first_date_str} {selected_time}", f"{FULL_DATE_FORMAT} {TIME_FORMAT}")
+    reminder_dt = user_tz.localize(reminder_dt)
+    current_dt_tz = datetime.datetime.now(user_tz)
+    time_diff = reminder_dt - current_dt_tz
+
+    # Format time difference
+    if time_diff.days > 0:
+        time_until = f"через {time_diff.days} дн. {time_diff.seconds // 3600} ч."
+    elif time_diff.seconds >= 3600:
+        hours = time_diff.seconds // 3600
+        minutes = (time_diff.seconds % 3600) // 60
+        time_until = f"через {hours} ч. {minutes} мин."
+    else:
+        minutes = time_diff.seconds // 60
+        time_until = f"через {minutes} мин."
+
     bot_message_id = data['bot_message_id']
     await callback.message.edit_text(
-        text=f"Напоминание успешно добавлено!\n\n"
-             f"Название: *{name_reminder}*\n"
-             f"Частота: *{frequency}*\n"
-             f"Даты: *{','.join(finalized_dates)}*\n"
-             f"Время: *{selected_time}*",
+        text=f"✅ Напоминание успешно добавлено!\n\n"
+             f"📝 Название: *{name_reminder}*\n"
+             f"🔁 Частота: *{frequency}*\n"
+             f"📅 Даты: *{','.join(finalized_dates)}*\n"
+             f"🕐 Время: *{selected_time}*\n\n"
+             f"⏰ Следующее срабатывание {time_until} (*{first_date_str} в {selected_time}*)",
         parse_mode="Markdown"
     )
     await state.clear()
@@ -375,19 +488,40 @@ async def get_time(message: types.Message, state: FSMContext):
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                'INSERT INTO reminders (user_id, name_reminder, frequency, dates, times, active) '
-                'VALUES (?, ?, ?, ?, ?, ?)',
-                (user_id, name_reminder, frequency, ",".join(finalized_dates), ",".join(time_list), 1)
+                'INSERT INTO reminders (user_id, name_reminder, frequency, dates, times, active, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (user_id, name_reminder, frequency, ",".join(finalized_dates), ",".join(time_list), 1, datetime.datetime.now(pytz.UTC).isoformat())
             )
             await db.commit()
 
+        # Calculate when reminder will trigger
+        user_tz = pytz.timezone(timezone)
+        first_date_str = finalized_dates[0]
+        first_time_str = time_list[0]
+        reminder_dt = datetime.datetime.strptime(f"{first_date_str} {first_time_str}", f"{FULL_DATE_FORMAT} {TIME_FORMAT}")
+        reminder_dt = user_tz.localize(reminder_dt)
+        current_dt_tz = datetime.datetime.now(user_tz)
+        time_diff = reminder_dt - current_dt_tz
+
+        # Format time difference
+        if time_diff.days > 0:
+            time_until = f"через {time_diff.days} дн. {time_diff.seconds // 3600} ч."
+        elif time_diff.seconds >= 3600:
+            hours = time_diff.seconds // 3600
+            minutes = (time_diff.seconds % 3600) // 60
+            time_until = f"через {hours} ч. {minutes} мин."
+        else:
+            minutes = time_diff.seconds // 60
+            time_until = f"через {minutes} мин."
+
         bot_message_id = data['bot_message_id']
         await message.bot.edit_message_text(
-            text=f"Напоминание успешно добавлено!\n\n"
-                 f"Название: *{name_reminder}*\n"
-                 f"Частота: *{frequency}*\n"
-                 f"Даты: *{','.join(finalized_dates)}*\n"
-                 f"Время: *{times}*",
+            text=f"✅ Напоминание успешно добавлено!\n\n"
+                 f"📝 Название: *{name_reminder}*\n"
+                 f"🔁 Частота: *{frequency}*\n"
+                 f"📅 Даты: *{','.join(finalized_dates)}*\n"
+                 f"🕐 Время: *{times}*\n\n"
+                 f"⏰ Следующее срабатывание {time_until} (*{first_date_str} в {first_time_str}*)",
             chat_id=message.chat.id,
             message_id=bot_message_id,
             parse_mode="Markdown"
@@ -415,7 +549,7 @@ async def get_time(message: types.Message, state: FSMContext):
 
 @router.message(F.text == 'Мои уведомления')
 async def list_reminders(message: types.Message):
-    """List all active reminders."""
+    """List all active reminders with inline buttons and grouping."""
     user_id = message.from_user.id
     timezone = await get_user_timezone(user_id)
 
@@ -427,11 +561,65 @@ async def list_reminders(message: types.Message):
         ) as cursor:
             reminders = await cursor.fetchall()
 
-    if reminders:
-        response = "Ваши активные уведомления:\n"
-        user_tz = pytz.timezone(timezone)
-        for reminder in reminders:
-            id, name, frequency, dates, times, active = reminder
+    if not reminders:
+        await message.answer("У вас нет активных уведомлений.")
+        return
+
+    user_tz = pytz.timezone(timezone)
+    current_dt = datetime.datetime.now(user_tz)
+    today = current_dt.date()
+    tomorrow = today + datetime.timedelta(days=1)
+    week_end = today + datetime.timedelta(days=7)
+
+    # Group reminders by time category
+    groups = {
+        "Сегодня": [],
+        "Завтра": [],
+        "На этой неделе": [],
+        "Позже": []
+    }
+
+    for reminder in reminders:
+        reminder_id, name, frequency, dates, times, active = reminder
+        date_list = dates.split(",")
+
+        # Find nearest date
+        nearest_date = None
+        for date_str in date_list:
+            date_dt = datetime.datetime.strptime(date_str, FULL_DATE_FORMAT)
+            date_local = date_dt.astimezone(user_tz).date()
+            if nearest_date is None or date_local < nearest_date:
+                nearest_date = date_local
+
+        # Determine emoji based on frequency and proximity
+        if frequency != FREQUENCY_ZERO:
+            emoji = "🔄"
+        elif nearest_date == today:
+            emoji = "⏰"
+        else:
+            emoji = "🔔"
+
+        reminder_data = (reminder_id, name, frequency, dates, times, nearest_date, emoji)
+
+        # Categorize reminder
+        if nearest_date == today:
+            groups["Сегодня"].append(reminder_data)
+        elif nearest_date == tomorrow:
+            groups["Завтра"].append(reminder_data)
+        elif nearest_date <= week_end:
+            groups["На этой неделе"].append(reminder_data)
+        else:
+            groups["Позже"].append(reminder_data)
+
+    # Send reminders grouped
+    for group_name, group_reminders in groups.items():
+        if not group_reminders:
+            continue
+
+        header = f"*{group_name}*\n\n"
+        await message.answer(header, parse_mode="Markdown")
+
+        for reminder_id, name, frequency, dates, times, nearest_date, emoji in group_reminders:
             date_list = dates.split(",")
             local_dates = []
             for date in date_list:
@@ -439,21 +627,142 @@ async def list_reminders(message: types.Message):
                 date_local = date_dt.astimezone(user_tz).strftime(FULL_DATE_FORMAT)
                 if date_local not in local_dates:
                     local_dates.append(date_local)
-            response += (
-                f"Название: {name}\n"
-                f"Частота: {frequency}\n"
-                f"Даты: {','.join(local_dates)}\n"
-                f"Время: {times}\n"
-                f"Команда для удаления: /delete{id}\n\n"
+
+            # Format frequency for display
+            freq_display = "Не повторяется" if frequency == FREQUENCY_ZERO else f"Повторяется каждые {frequency}"
+
+            card_text = (
+                f"{emoji} *{name}*\n"
+                f"📅 Даты: {', '.join(local_dates[:3])}" + ("..." if len(local_dates) > 3 else "") + "\n"
+                f"🕐 Время: {times}\n"
+                f"🔁 {freq_display}"
             )
-        await message.answer(response)
-    else:
-        await message.answer("У вас нет активных уведомлений.")
+
+            # Create inline buttons for each reminder
+            inline_keyboard = [
+                [
+                    InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{reminder_id}"),
+                    InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete_confirm_{reminder_id}")
+                ]
+            ]
+            markup = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+            await message.answer(card_text, reply_markup=markup, parse_mode="Markdown")
+
+
+@router.callback_query(lambda c: c.data.startswith("delete_confirm_"))
+async def delete_confirmation(callback: types.CallbackQuery):
+    """Show delete confirmation dialog."""
+    reminder_id = int(callback.data.split("_")[2])
+
+    # Create confirmation buttons
+    inline_keyboard = [
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delete_yes_{reminder_id}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"delete_no_{reminder_id}")
+        ]
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+    await callback.message.edit_text(
+        "Вы уверены, что хотите удалить это напоминание?",
+        reply_markup=markup
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data.startswith("delete_yes_"))
+async def delete_reminder_confirmed(callback: types.CallbackQuery):
+    """Delete reminder after confirmation."""
+    reminder_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Get reminder info before deleting for history
+        async with db.execute(
+            'SELECT name_reminder, frequency, dates, times FROM reminders WHERE id = ? AND user_id = ?',
+            (reminder_id, user_id)
+        ) as cursor:
+            reminder_info = await cursor.fetchone()
+
+        if not reminder_info:
+            await callback.message.edit_text("Напоминание не найдено.")
+            await callback.answer()
+            return
+
+        name, frequency, dates, times = reminder_info
+
+        # Save to history
+        completed_at = datetime.datetime.now(pytz.UTC).isoformat()
+        await db.execute(
+            'INSERT INTO reminder_history (reminder_id, user_id, name_reminder, frequency, dates, times, completed_at, action) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (reminder_id, user_id, name, frequency, dates, times, completed_at, 'deleted')
+        )
+
+        # Delete reminder
+        await db.execute(
+            'DELETE FROM reminders WHERE id = ? AND user_id = ?',
+            (reminder_id, user_id)
+        )
+        await db.commit()
+
+    await callback.message.edit_text("✅ Напоминание успешно удалено.")
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data.startswith("delete_no_"))
+async def delete_reminder_cancelled(callback: types.CallbackQuery):
+    """Cancel reminder deletion."""
+    reminder_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT name_reminder, frequency, dates, times FROM reminders WHERE id = ? AND user_id = ?',
+            (reminder_id, user_id)
+        ) as cursor:
+            reminder_info = await cursor.fetchone()
+
+    if reminder_info:
+        name, frequency, dates, times = reminder_info
+        timezone = await get_user_timezone(user_id)
+        user_tz = pytz.timezone(timezone)
+
+        date_list = dates.split(",")
+        local_dates = []
+        for date in date_list:
+            date_dt = datetime.datetime.strptime(date, FULL_DATE_FORMAT)
+            date_local = date_dt.astimezone(user_tz).strftime(FULL_DATE_FORMAT)
+            if date_local not in local_dates:
+                local_dates.append(date_local)
+
+        emoji = "🔄" if frequency != FREQUENCY_ZERO else "🔔"
+        freq_display = "Не повторяется" if frequency == FREQUENCY_ZERO else f"Повторяется каждые {frequency}"
+
+        card_text = (
+            f"{emoji} *{name}*\n"
+            f"📅 Даты: {', '.join(local_dates[:3])}" + ("..." if len(local_dates) > 3 else "") + "\n"
+            f"🕐 Время: {times}\n"
+            f"🔁 {freq_display}"
+        )
+
+        inline_keyboard = [
+            [
+                InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{reminder_id}"),
+                InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete_confirm_{reminder_id}")
+            ]
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+        await callback.message.edit_text(card_text, reply_markup=markup, parse_mode="Markdown")
+
+    await callback.answer("Удаление отменено")
 
 
 @router.message(F.text.startswith('/delete'))
 async def handle_delete_command(message: types.Message):
-    """Delete a reminder by ID."""
+    """Delete a reminder by ID (legacy command)."""
     try:
         reminder_id = int(message.text.split("/delete")[1])
     except ValueError:
@@ -475,7 +784,7 @@ async def handle_delete_command(message: types.Message):
         )
         await db.commit()
 
-    await list_reminders(message)
+    await message.answer("✅ Напоминание успешно удалено.")
 
 
 @router.callback_query(lambda c: c.data == "cancel")
@@ -500,6 +809,7 @@ async def handle_calendar_callback(callback: types.CallbackQuery, state: FSMCont
     action, year, month, day = separate_callback_data(callback.data)
     data = await state.get_data()
     selected_dates = data.get('selected_calendar_dates', [])
+    calendar_mode = data.get('calendar_mode', False)
 
     # Convert string dates back to date objects if needed
     if selected_dates and isinstance(selected_dates[0], str):
@@ -510,7 +820,7 @@ async def handle_calendar_callback(callback: types.CallbackQuery, state: FSMCont
     if action == "IGNORE":
         await callback.answer()
     elif action == "DAY":
-        # Toggle date selection
+        # Toggle date selection and switch to calendar-only mode
         selected_date = datetime.date(year, month, day)
         if selected_date in selected_dates:
             selected_dates.remove(selected_date)
@@ -519,12 +829,34 @@ async def handle_calendar_callback(callback: types.CallbackQuery, state: FSMCont
             selected_dates.append(selected_date)
             await callback.answer("Дата добавлена")
 
-        # Update state with selected dates
-        await state.update_data(selected_calendar_dates=selected_dates)
+        # Update state with selected dates and enable calendar mode
+        await state.update_data(selected_calendar_dates=selected_dates, calendar_mode=True)
 
-        # Update calendar with checkmarks
+        # Update calendar with checkmarks and show selected dates
         calendar_markup = create_calendar(year, month, selected_dates)
-        await callback.message.edit_reply_markup(reply_markup=calendar_markup)
+
+        # Format selected dates for display
+        selected_dates_sorted = sorted(selected_dates)
+        selected_dates_str = ", ".join([d.strftime("%d.%m.%Y") for d in selected_dates_sorted])
+
+        name_reminder = data['name_reminder']
+        frequency = data['frequency']
+
+        message_text = (
+            f"Название уведомления: *{name_reminder}*\n"
+            f"Частота: *{frequency}*\n\n"
+        )
+
+        if selected_dates:
+            message_text += f"Выбранные даты:\n*{selected_dates_str}*\n\n"
+
+        message_text += "Выберите даты из календаря:"
+
+        await callback.message.edit_text(
+            text=message_text,
+            reply_markup=calendar_markup,
+            parse_mode="Markdown"
+        )
 
     elif action == "PREV-MONTH":
         pre = curr - datetime.timedelta(days=1)
@@ -537,6 +869,43 @@ async def handle_calendar_callback(callback: types.CallbackQuery, state: FSMCont
         calendar_markup = create_calendar(ne.year, ne.month, selected_dates)
         await callback.message.edit_reply_markup(reply_markup=calendar_markup)
         await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "clear_dates")
+async def clear_calendar_dates(callback: types.CallbackQuery, state: FSMContext):
+    """Clear all selected dates from calendar."""
+    current_state = await state.get_state()
+
+    if current_state != ReminderStates.waiting_for_date:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+
+    # Clear selected dates
+    await state.update_data(selected_calendar_dates=[])
+
+    # Get current calendar view
+    callback_data = callback.message.reply_markup.inline_keyboard[0][0].callback_data
+    if ";" in callback_data:
+        _, year, month, _ = separate_callback_data(callback_data + ";0;0;0")
+    else:
+        now = datetime.datetime.now()
+        year, month = now.year, now.month
+
+    calendar_markup = create_calendar(year, month, [])
+
+    name_reminder = data['name_reminder']
+    frequency = data['frequency']
+
+    await callback.message.edit_text(
+        text=f"Название уведомления: *{name_reminder}*\n"
+             f"Частота: *{frequency}*\n\n"
+             f"Выберите даты из календаря:",
+        reply_markup=calendar_markup,
+        parse_mode="Markdown"
+    )
+    await callback.answer("Выбор очищен")
 
 
 @router.callback_query(lambda c: c.data == "confirm_dates")
@@ -583,6 +952,65 @@ async def confirm_calendar_dates(callback: types.CallbackQuery, state: FSMContex
     await callback.answer()
 
 
+@router.callback_query(lambda c: c.data.startswith("snooze_"))
+async def handle_snooze(callback: types.CallbackQuery):
+    """Handle snooze button clicks."""
+    parts = callback.data.split("_")
+    snooze_type = parts[1]
+    reminder_id = int(parts[2])
+    user_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Get reminder info
+        async with db.execute(
+            'SELECT name_reminder, expiration_time FROM reminders WHERE id = ? AND user_id = ?',
+            (reminder_id, user_id)
+        ) as cursor:
+            reminder_info = await cursor.fetchone()
+
+        if not reminder_info:
+            await callback.answer("Напоминание не найдено.")
+            return
+
+        name, expiration_time = reminder_info
+        timezone = await get_user_timezone(user_id)
+        user_tz = pytz.timezone(timezone)
+        current_dt = datetime.datetime.now(user_tz)
+
+        # Calculate snooze time
+        if snooze_type == "5":
+            snooze_dt = current_dt + datetime.timedelta(minutes=5)
+            snooze_text = "5 минут"
+        elif snooze_type == "15":
+            snooze_dt = current_dt + datetime.timedelta(minutes=15)
+            snooze_text = "15 минут"
+        elif snooze_type == "60":
+            snooze_dt = current_dt + datetime.timedelta(hours=1)
+            snooze_text = "1 час"
+        elif snooze_type == "tomorrow":
+            snooze_dt = (current_dt + datetime.timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+            snooze_text = "завтра в 9:00"
+        else:
+            await callback.answer("Неизвестный тип отложения.")
+            return
+
+        new_date = snooze_dt.strftime(FULL_DATE_FORMAT)
+        new_time = snooze_dt.strftime(TIME_FORMAT)
+
+        # Update reminder with new date/time
+        await db.execute(
+            'UPDATE reminders SET dates = ?, times = ? WHERE id = ? AND user_id = ?',
+            (new_date, new_time, reminder_id, user_id)
+        )
+        await db.commit()
+
+    await callback.message.edit_text(
+        f"✅ Напоминание '*{name}*' отложено на {snooze_text}",
+        parse_mode="Markdown"
+    )
+    await callback.answer(f"Отложено на {snooze_text}")
+
+
 @router.callback_query(lambda c: c.data.startswith(("delete_", "last_")))
 async def delete_new_reminder(callback: types.CallbackQuery):
     """Mark reminder as done or delete temporary reminder."""
@@ -591,8 +1019,28 @@ async def delete_new_reminder(callback: types.CallbackQuery):
     if callback_data.startswith("last_"):
         # For last temporary reminder, just change button to "doned ✅"
         reminder_id = int(callback_data.split("_")[1])
+
+        # Save to history
+        user_id = callback.from_user.id
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                'SELECT name_reminder, frequency, dates, times FROM reminders WHERE id = ? AND user_id = ?',
+                (reminder_id, user_id)
+            ) as cursor:
+                reminder_info = await cursor.fetchone()
+
+            if reminder_info:
+                name, frequency, dates, times = reminder_info
+                completed_at = datetime.datetime.now(pytz.UTC).isoformat()
+                await db.execute(
+                    'INSERT INTO reminder_history (reminder_id, user_id, name_reminder, frequency, dates, times, completed_at, action) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    (reminder_id, user_id, name, frequency, dates, times, completed_at, 'completed')
+                )
+                await db.commit()
+
         inline_button_doned = InlineKeyboardButton(
-            text="doned ✅",
+            text="✅ Выполнено",
             callback_data=f"doned_{reminder_id}"
         )
         inline_markup_doned = InlineKeyboardMarkup(inline_keyboard=[[inline_button_doned]])
@@ -602,13 +1050,27 @@ async def delete_new_reminder(callback: types.CallbackQuery):
         # Delete temporary reminder from database
         new_reminder_id = int(callback_data.split("_")[1])
         async with aiosqlite.connect(DB_PATH) as db:
+            # Get reminder info for history
             async with db.execute(
-                'SELECT 1 FROM reminders WHERE id = ? AND user_id = ?',
+                'SELECT name_reminder, frequency, dates, times FROM reminders WHERE id = ? AND user_id = ?',
                 (new_reminder_id, callback.from_user.id)
             ) as cursor:
-                if not await cursor.fetchone():
-                    await callback.answer("Напоминание не найдено.")
-                    return
+                reminder_info = await cursor.fetchone()
+
+            if not reminder_info:
+                await callback.answer("Напоминание не найдено.")
+                return
+
+            name, frequency, dates, times = reminder_info
+
+            # Save to history
+            completed_at = datetime.datetime.now(pytz.UTC).isoformat()
+            await db.execute(
+                'INSERT INTO reminder_history (reminder_id, user_id, name_reminder, frequency, dates, times, completed_at, action) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (new_reminder_id, callback.from_user.id, name, frequency, dates, times, completed_at, 'completed')
+            )
+
             await db.execute(
                 'DELETE FROM reminders WHERE id = ? AND user_id = ?',
                 (new_reminder_id, callback.from_user.id)
@@ -616,9 +1078,74 @@ async def delete_new_reminder(callback: types.CallbackQuery):
             await db.commit()
 
         inline_button_doned = InlineKeyboardButton(
-            text="doned ✅",
+            text="✅ Выполнено",
             callback_data=f"doned_{new_reminder_id}"
         )
         inline_markup_doned = InlineKeyboardMarkup(inline_keyboard=[[inline_button_doned]])
         await callback.message.edit_reply_markup(reply_markup=inline_markup_doned)
         await callback.answer("Напоминание успешно выполнено.")
+
+
+@router.message(F.text == '📊 История')
+async def show_history(message: types.Message):
+    """Show reminder history and statistics."""
+    user_id = message.from_user.id
+    timezone = await get_user_timezone(user_id)
+    user_tz = pytz.timezone(timezone)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Get statistics for the past week
+        week_ago = (datetime.datetime.now(user_tz) - datetime.timedelta(days=7)).isoformat()
+
+        async with db.execute(
+            'SELECT COUNT(*) FROM reminder_history WHERE user_id = ? AND completed_at >= ?',
+            (user_id, week_ago)
+        ) as cursor:
+            week_count = (await cursor.fetchone())[0]
+
+        async with db.execute(
+            'SELECT COUNT(*) FROM reminder_history WHERE user_id = ? AND action = "completed"',
+            (user_id,)
+        ) as cursor:
+            total_completed = (await cursor.fetchone())[0]
+
+        async with db.execute(
+            'SELECT COUNT(*) FROM reminder_history WHERE user_id = ?',
+            (user_id,)
+        ) as cursor:
+            total_count = (await cursor.fetchone())[0]
+
+        # Get recent history (last 10 items)
+        async with db.execute(
+            'SELECT name_reminder, completed_at, action FROM reminder_history '
+            'WHERE user_id = ? ORDER BY completed_at DESC LIMIT 10',
+            (user_id,)
+        ) as cursor:
+            history_items = await cursor.fetchall()
+
+    # Send statistics
+    stats_text = (
+        "📊 *Ваша статистика*\n\n"
+        f"За последнюю неделю: {week_count} напоминаний\n"
+        f"Всего выполнено: {total_completed}\n"
+        f"Всего действий: {total_count}\n"
+    )
+
+    await message.answer(stats_text, parse_mode="Markdown")
+
+    # Send history
+    if history_items:
+        history_text = "*Последние действия:*\n\n"
+
+        for name, completed_at, action in history_items:
+            completed_dt = datetime.datetime.fromisoformat(completed_at).astimezone(user_tz)
+            date_str = completed_dt.strftime("%d.%m.%Y %H:%M")
+
+            action_emoji = "✅" if action == "completed" else "🗑️"
+            action_text = "выполнено" if action == "completed" else "удалено"
+
+            history_text += f"{action_emoji} *{name}* - {action_text}\n📅 {date_str}\n\n"
+
+        await message.answer(history_text, parse_mode="Markdown")
+    else:
+        await message.answer("История пуста")
