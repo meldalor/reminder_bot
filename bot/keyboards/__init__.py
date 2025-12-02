@@ -5,7 +5,8 @@ from .main_keyboard import (
     inline_markup_cancel,
     create_inline_keyboard,
     inline_markup_quick_templates,
-    inline_markup_popular_times
+    inline_markup_popular_times,
+    inline_markup_frequency_presets
 )
 from .calendar_keyboard import create_calendar, separate_callback_data
 
@@ -15,6 +16,7 @@ __all__ = [
     "create_inline_keyboard",
     "inline_markup_quick_templates",
     "inline_markup_popular_times",
+    "inline_markup_frequency_presets",
     "create_calendar",
     "separate_callback_data"
 ]
