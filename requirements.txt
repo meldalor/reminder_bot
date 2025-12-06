@@ -1,0 +1,13 @@
+# Core dependencies
+aiogram==3.4.1
+aiosqlite==0.19.0
+APScheduler==3.10.4
+python-dateutil==2.8.2
+pytz==2024.1
+python-dotenv==1.0.1
+
+# Optional dependencies for development
+# black==24.1.1
+# flake8==7.0.0
+# pytest==7.4.4
+# pytest-asyncio==0.23.3
